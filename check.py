@@ -1,7 +1,7 @@
-"""Prueba rápida: python -m bot.check"""
-from .config import cfg
-from .exchange import BingX
-from .telegram_notify import Telegram
+"""Prueba rápida: python check.py"""
+from config import cfg
+from exchange import BingX
+from telegram_notify import Telegram
 
 ex = BingX(cfg)
 syms = ex.top_symbols()

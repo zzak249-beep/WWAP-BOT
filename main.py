@@ -4,10 +4,10 @@ import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from .config import cfg
-from .exchange import BingX
-from .strategy import analyze
-from .telegram_notify import Telegram
+from config import cfg
+from exchange import BingX
+from strategy import analyze
+from telegram_notify import Telegram
 
 logging.basicConfig(
     level=getattr(logging, cfg.log_level, logging.INFO),
