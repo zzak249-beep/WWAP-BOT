@@ -1,12 +1,13 @@
 import logging
 import sys
+from collections import Counter
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from config import cfg
 from exchange import BingX
-from strategy import analyze
+from strategy import analyze, btc_state_now
 from telegram_notify import Telegram
 
 logging.basicConfig(
@@ -45,6 +46,7 @@ class Bot:
         self.last_monitor = 0.0
         self.last_full_alert = 0.0
         self.last_manage = 0.0
+        self.btc_state = "neutral"
 
     # ---------- utilidades ----------
     def in_session(self):
@@ -85,13 +87,21 @@ class Bot:
     # ---------- scanner ----------
     def scan(self):
         symbols = self.ex.top_symbols()
+        btc_state = "neutral"
+        if cfg.btc_filter:
+            try:
+                bs = "BTC/USDT:USDT"
+                btc_state = btc_state_now(self.ex.ohlcv(bs, cfg.timeframe, 300), self.htf_df(bs), cfg)
+            except Exception as e:
+                log.warning("estado BTC no disponible: %s", e)
+        self.btc_state = btc_state
         out = []
         for s in symbols:
             self.manage()
             try:
                 df = self.ex.ohlcv(s, cfg.timeframe, 300)
                 dfh = self.htf_df(s)
-                a = analyze(s, df, dfh, cfg)
+                a = analyze(s, df, dfh, cfg, btc_state, is_btc=s.startswith("BTC/"))
                 if a:
                     out.append(a)
             except Exception as e:
@@ -129,7 +139,9 @@ class Bot:
             if a.signal and bucket - self.cooldown.get(a.symbol, -999) > cfg.cooldown_candles
         ]
         trending = sum(1 for a in analyses if a.trend != "none")
-        log.info("escaneadas=%d en tendencia=%d señales=%d", n, trending, len(sigs))
+        blocked = Counter(a.why for a in analyses if a.trend != "none" and not a.signal and a.why not in ("", "sin pullback"))
+        log.info("escaneadas=%d en tendencia=%d señales=%d BTC=%s bloqueadas=%s",
+                 n, trending, len(sigs), self.btc_state, dict(blocked))
         for a in sigs[: cfg.max_signals_per_scan]:
             self.cooldown[a.symbol] = bucket
             if self.live:
@@ -153,7 +165,7 @@ class Bot:
             f"Entrada ≈ {fp(a.entry)}\n"
             f"SL: {fp(sl)} (-{a.sl_pct:.2f}%)\n"
             f"TP: {fp(tp)} (+{a.sl_pct * cfg.rr:.2f}%)\n"
-            f"R:R 1:{cfg.rr:g} | Score {a.score} | VolRel {a.rel_vol:.1f}x | ATR {a.atr_pct:.2f}%\n"
+            f"R:R 1:{cfg.rr:g} | Score {a.score} | VolRel {a.rel_vol:.1f}x | ADX {a.adx:.0f} | ATR {a.atr_pct:.2f}%\n"
             f"Estado: {mode}"
         )
 
@@ -186,7 +198,7 @@ class Bot:
             self.trades_today += 1
             self.tracked[a.symbol] = {
                 "side": a.side, "entry": price, "sl": sl, "tp": tp, "qty": qty,
-                "R": a.sl_dist, "be": False, "ext": 0,
+                "R": a.sl_dist, "be": False, "ext": 0, "ts": time.time(),
             }
             self.tg.send(
                 f"✅ Orden enviada {a.side.upper()} <b>{a.symbol}</b>\n"
@@ -218,6 +230,15 @@ class Bot:
         R = t["R"]
         price = self.ex.last_price(sym)
         profit_r = s * (price - t["entry"]) / R
+
+        # time stop (opcional): si en N velas no hay avance mínimo, cerrar
+        if cfg.time_stop_bars > 0 and not t["be"]:
+            if time.time() - t["ts"] >= cfg.time_stop_bars * self.tf_sec and profit_r < cfg.time_stop_min_r:
+                self.ex.close_position(sym, side, t["qty"])
+                self.ex.cancel_open(sym)
+                self.tracked.pop(sym, None)
+                self.tg.send(f"⏱ {sym}: sin avance en {cfg.time_stop_bars} velas ({profit_r:+.1f}R) → cerrada a mercado")
+                return
 
         if cfg.trail:
             if not t["be"] and profit_r >= cfg.be_r:
@@ -258,6 +279,7 @@ class Bot:
         for sym in list(self.tracked):
             if sym not in open_syms:
                 t = self.tracked.pop(sym)
+                self.ex.cancel_open(sym)   # limpia SL/TP sueltos para que no afecten a futuras posiciones
                 self.tg.send(f"🏁 Posición cerrada {t['side'].upper()} {sym}\nEquity actual: {equity:.2f} USDT")
 
     # ---------- comandos de Telegram ----------

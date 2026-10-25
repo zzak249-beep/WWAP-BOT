@@ -195,3 +195,10 @@ class BingX:
             except Exception as ex:
                 log.warning("no pude cancelar %s anterior %s: %s", kind, oid, ex)
         return len(old)
+
+    def cancel_open(self, symbol):
+        """Cancela órdenes condicionales que hayan quedado tras cerrarse una posición."""
+        try:
+            self.ex.cancel_all_orders(symbol)
+        except Exception as ex:
+            log.info("cancel_open %s: %s", symbol, ex)

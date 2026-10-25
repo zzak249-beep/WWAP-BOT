@@ -39,7 +39,7 @@ class Config:
     ema_len: int = field(default_factory=lambda: _i("EMA_LEN", 200))
     atr_len: int = field(default_factory=lambda: _i("ATR_LEN", 14))
     atr_mult: float = field(default_factory=lambda: _f("ATR_MULT", 1.5))
-    min_sl_pct: float = field(default_factory=lambda: _f("MIN_SL_PCT", 0.30))
+    min_sl_pct: float = field(default_factory=lambda: _f("MIN_SL_PCT", 0.50))
     max_sl_pct: float = field(default_factory=lambda: _f("MAX_SL_PCT", 2.0))
     rr: float = field(default_factory=lambda: _f("RR", 2.0))
 
@@ -81,6 +81,23 @@ class Config:
     ext_r: float = field(default_factory=lambda: _f("EXTEND_R", 1.0))
     max_ext: int = field(default_factory=lambda: _i("MAX_EXTENSIONS", 3))
     manage_sec: int = field(default_factory=lambda: _i("MANAGE_SEC", 15))
+
+    vwap_anchor_hour: int = field(default_factory=lambda: _i("VWAP_ANCHOR_HOUR", 0))
+    vwap_min_bars: int = field(default_factory=lambda: _i("VWAP_MIN_BARS", 36))
+
+    # filtros v4
+    adx_len: int = field(default_factory=lambda: _i("ADX_LEN", 14))
+    adx_min: float = field(default_factory=lambda: _f("ADX_MIN", 20))
+    slope_filter: bool = field(default_factory=lambda: _b("SLOPE_FILTER", True))
+    slope_bars: int = field(default_factory=lambda: _i("SLOPE_BARS", 12))
+    min_rel_vol: float = field(default_factory=lambda: _f("MIN_REL_VOL", 0.7))
+    fee_rt_pct: float = field(default_factory=lambda: _f("FEE_RT_PCT", 0.10))
+    slip_pct: float = field(default_factory=lambda: _f("SLIP_PCT", 0.02))
+    max_cost_ratio: float = field(default_factory=lambda: _f("MAX_COST_RATIO", 0.25))
+    btc_filter: bool = field(default_factory=lambda: _b("BTC_FILTER", True))
+    btc_mode: str = field(default_factory=lambda: _s("BTC_MODE", "soft").lower())
+    time_stop_bars: int = field(default_factory=lambda: _i("TIME_STOP_BARS", 0))
+    time_stop_min_r: float = field(default_factory=lambda: _f("TIME_STOP_MIN_R", 0.3))
 
     log_level: str = field(default_factory=lambda: _s("LOG_LEVEL", "INFO").upper())
 
