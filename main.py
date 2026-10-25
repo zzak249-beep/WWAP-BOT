@@ -30,6 +30,7 @@ class Bot:
         self.tg = Telegram(cfg.tg_token, cfg.tg_chat)
         self.ex = BingX(cfg)
         self.tf_sec = self.ex.ex.parse_timeframe(cfg.timeframe)
+        self.htf_sec = self.ex.ex.parse_timeframe(cfg.htf)
 
         self.paused = False
         self.halted = False
@@ -38,9 +39,12 @@ class Bot:
         self.start_equity = None
         self.cooldown = {}
         self.tracked = {}
+        self.htf_cache = {}
         self.last_analyses = []
-        self.cache = {"equity": None, "positions": 0}
+        self.cache = {"equity": None, "positions": 0, "pos_detail": []}
         self.last_monitor = 0.0
+        self.last_full_alert = 0.0
+        self.last_manage = 0.0
 
     # ---------- utilidades ----------
     def in_session(self):
@@ -60,14 +64,33 @@ class Bot:
                 self.start_equity = eq
                 self.cache["equity"] = eq
 
+    def refresh_positions(self):
+        pos = self.ex.open_positions()
+        self.cache["positions"] = len(pos)
+        self.cache["pos_detail"] = [
+            f"{s} {p.get('side')} qty={p.get('contracts')} entrada={p.get('entryPrice')} pnl={p.get('unrealizedPnl')}"
+            for s, p in pos.items()
+        ]
+        return pos
+
+    def htf_df(self, symbol):
+        bucket = int(time.time() // self.htf_sec)
+        hit = self.htf_cache.get(symbol)
+        if hit and hit[0] == bucket:
+            return hit[1]
+        dfh = self.ex.ohlcv(symbol, cfg.htf, 300)
+        self.htf_cache[symbol] = (bucket, dfh)
+        return dfh
+
     # ---------- scanner ----------
     def scan(self):
         symbols = self.ex.top_symbols()
         out = []
         for s in symbols:
+            self.manage()
             try:
                 df = self.ex.ohlcv(s, cfg.timeframe, 300)
-                dfh = self.ex.ohlcv(s, cfg.htf, 300)
+                dfh = self.htf_df(s)
                 a = analyze(s, df, dfh, cfg)
                 if a:
                     out.append(a)
@@ -84,6 +107,20 @@ class Bot:
         if not self.in_session():
             log.info("fuera de sesión")
             return
+
+        if self.live:
+            pos = self.refresh_positions()
+            if len(pos) >= cfg.max_open:
+                log.info("máx. posiciones (%d): %s", len(pos), self.cache["pos_detail"])
+                if time.time() - self.last_full_alert > 1800:
+                    self.last_full_alert = time.time()
+                    self.tg.send(
+                        f"⛔ No escaneo: el bot ve {len(pos)} posiciones abiertas (máx {cfg.max_open}).\n"
+                        + "\n".join(self.cache["pos_detail"])
+                        + "\nSi no coincide con tu BingX, escribe /pos y avísame."
+                    )
+                return
+
         analyses, n = self.scan()
         self.last_analyses = analyses
         bucket = int(time.time() // self.tf_sec)
@@ -95,9 +132,12 @@ class Bot:
         log.info("escaneadas=%d en tendencia=%d señales=%d", n, trending, len(sigs))
         for a in sigs[: cfg.max_signals_per_scan]:
             self.cooldown[a.symbol] = bucket
-            self.notify_signal(a)
             if self.live:
-                self.execute(a)
+                ok, why = self.execute(a)
+                if not ok:
+                    self.notify_signal(a, f"NO ejecutada: {why}")
+            else:
+                self.notify_signal(a, "solo señal (no se opera)")
 
     # ---------- señales / ejecución ----------
     def levels(self, a, price):
@@ -105,67 +145,118 @@ class Bot:
             return price - a.sl_dist, price + a.sl_dist * cfg.rr
         return price + a.sl_dist, price - a.sl_dist * cfg.rr
 
-    def notify_signal(self, a):
+    def notify_signal(self, a, mode):
         sl, tp = self.levels(a, a.entry)
         icon = "🟢 LONG" if a.side == "long" else "🔴 SHORT"
-        mode = "EJECUTANDO en BingX" if self.live else "solo señal (no se opera)"
         self.tg.send(
             f"{icon} <b>{a.symbol}</b> ({cfg.timeframe})\n"
             f"Entrada ≈ {fp(a.entry)}\n"
             f"SL: {fp(sl)} (-{a.sl_pct:.2f}%)\n"
             f"TP: {fp(tp)} (+{a.sl_pct * cfg.rr:.2f}%)\n"
             f"R:R 1:{cfg.rr:g} | Score {a.score} | VolRel {a.rel_vol:.1f}x | ATR {a.atr_pct:.2f}%\n"
-            f"Modo: {mode}"
+            f"Estado: {mode}"
         )
 
     def execute(self, a):
+        """Devuelve (ok, motivo)."""
         try:
             if self.trades_today >= cfg.max_trades_day:
-                self.tg.send("⛔ Límite diario de operaciones alcanzado")
-                return
-            pos = self.ex.open_positions()
-            if len(pos) >= cfg.max_open or a.symbol in pos:
-                log.info("saltada %s (posiciones abiertas=%d)", a.symbol, len(pos))
-                return
+                return False, "límite diario de operaciones"
+            pos = self.refresh_positions()
+            if len(pos) >= cfg.max_open:
+                return False, f"máx. posiciones ({len(pos)})"
+            if any(k.split("#")[0] == a.symbol for k in pos):
+                return False, "ya hay posición en esta moneda"
             equity, free = self.ex.balance()
             self.cache["equity"] = equity
             if self.start_equity and equity <= self.start_equity * (1 - cfg.daily_loss_pct / 100):
                 self.halted = True
-                self.tg.send(f"🛑 Límite de pérdida diaria ({cfg.daily_loss_pct}%) alcanzado. Bot detenido hasta mañana (UTC).")
-                return
+                self.tg.send(f"🛑 Pérdida diaria ({cfg.daily_loss_pct}%) alcanzada. Bot detenido hasta mañana (UTC).")
+                return False, "límite de pérdida diaria"
             price = self.ex.last_price(a.symbol)
             if abs(price - a.entry) > 0.5 * a.sl_dist:
-                self.tg.send(f"⚠️ {a.symbol}: el precio se alejó de la entrada, no persigo la operación.")
-                return
+                return False, "el precio se alejó de la entrada"
             sl, tp = self.levels(a, price)
             qty = self.ex.position_size(a.symbol, equity, free, a.sl_dist, price)
             if qty <= 0:
-                self.tg.send(f"⚠️ {a.symbol}: saldo insuficiente o tamaño bajo el mínimo del contrato.")
-                return
+                return False, f"saldo/tamaño bajo el mínimo del contrato (equity {equity:.2f}, libre {free:.2f})"
             side = "buy" if a.side == "long" else "sell"
             self.ex.setup_symbol(a.symbol)
             self.ex.open_trade(a.symbol, side, qty, sl, tp)
             self.trades_today += 1
-            self.tracked[a.symbol] = {"side": a.side, "entry": price, "sl": sl, "tp": tp, "qty": qty}
+            self.tracked[a.symbol] = {
+                "side": a.side, "entry": price, "sl": sl, "tp": tp, "qty": qty,
+                "R": a.sl_dist, "be": False, "ext": 0,
+            }
             self.tg.send(
                 f"✅ Orden enviada {a.side.upper()} <b>{a.symbol}</b>\n"
                 f"Cantidad: {qty} | Entrada ≈ {fp(price)}\n"
-                f"SL {fp(sl)} | TP {fp(tp)} | Riesgo {cfg.risk_pct}% | {cfg.leverage}x"
+                f"SL {fp(sl)} | TP {fp(tp)} | Riesgo {cfg.risk_pct}% | {cfg.leverage}x\n"
+                f"Trailing: {'ON' if cfg.trail else 'OFF'}\n"
+                f"Score {a.score} | VolRel {a.rel_vol:.1f}x"
             )
+            return True, ""
         except Exception as e:
             log.exception("error ejecutando")
             self.tg.send(f"❌ Error ejecutando {a.symbol}: {e}")
+            return False, f"error: {e}"
+
+    # ---------- gestión de ganancias: break-even, trailing y TP ampliable ----------
+    def manage(self):
+        if not self.live or not self.tracked or time.time() - self.last_manage < cfg.manage_sec:
+            return
+        self.last_manage = time.time()
+        for sym, t in list(self.tracked.items()):
+            try:
+                self._manage_one(sym, t)
+            except Exception as e:
+                log.warning("manage %s: %s", sym, e)
+
+    def _manage_one(self, sym, t):
+        s = 1 if t["side"] == "long" else -1
+        side = "buy" if s == 1 else "sell"
+        R = t["R"]
+        price = self.ex.last_price(sym)
+        profit_r = s * (price - t["entry"]) / R
+
+        if cfg.trail:
+            if not t["be"] and profit_r >= cfg.be_r:
+                new_sl = t["entry"] * (1 + s * cfg.be_buf_pct / 100)
+                if s * (new_sl - t["sl"]) > 0:
+                    self.ex.replace_protective(sym, side, t["qty"], "sl", new_sl)
+                    t["sl"], t["be"] = new_sl, True
+                    self.tg.send(f"🔒 {sym}: +{profit_r:.1f}R → stop movido a break-even ({fp(new_sl)})")
+            elif t["be"]:
+                trail_sl = price - s * cfg.trail_r * R
+                if s * (trail_sl - t["sl"]) >= cfg.trail_step_r * R:
+                    self.ex.replace_protective(sym, side, t["qty"], "sl", trail_sl)
+                    t["sl"] = trail_sl
+                    self.tg.send(f"📈 {sym}: +{profit_r:.1f}R → stop subido a {fp(trail_sl)} (beneficio asegurado)")
+
+        if cfg.ext_tp and t["ext"] < cfg.max_ext:
+            tp_r = s * (t["tp"] - t["entry"]) / R
+            if profit_r >= tp_r - 0.2:
+                new_tp = t["tp"] + s * cfg.ext_r * R
+                try:
+                    self.ex.replace_protective(sym, side, t["qty"], "tp", new_tp, require_old=True)
+                    t["tp"] = new_tp
+                    t["ext"] += 1
+                    self.tg.send(f"🎯 {sym}: objetivo ampliado a {fp(new_tp)} (ampliación {t['ext']}/{cfg.max_ext})")
+                except Exception as e:
+                    t["ext"] = cfg.max_ext  # no insistir
+                    log.warning("no se pudo ampliar TP de %s: %s", sym, e)
 
     # ---------- monitoreo ----------
     def monitor(self):
         if not self.live or time.time() - self.last_monitor < 30:
             return
         self.last_monitor = time.time()
-        pos = self.ex.open_positions()
+        pos = self.refresh_positions()
         equity, _ = self.ex.balance()
-        self.cache.update({"equity": equity, "positions": len(pos)})
+        self.cache["equity"] = equity
+        open_syms = {k.split("#")[0] for k in pos}
         for sym in list(self.tracked):
-            if sym not in pos:
+            if sym not in open_syms:
                 t = self.tracked.pop(sym)
                 self.tg.send(f"🏁 Posición cerrada {t['side'].upper()} {sym}\nEquity actual: {equity:.2f} USDT")
 
@@ -178,6 +269,9 @@ class Bot:
             self.paused = False
             self.halted = False
             return "▶️ Bot reanudado."
+        if cmd == "/pos":
+            d = self.cache["pos_detail"]
+            return "Posiciones que ve el bot:\n" + ("\n".join(d) if d else "ninguna")
         if cmd == "/status":
             return (
                 f"Modo: {'LIVE' if self.live else 'SEÑALES'}\n"
@@ -198,7 +292,7 @@ class Bot:
             ]
             return "<b>Mejores monedas (último escaneo)</b>\n" + "\n".join(lines)
         if cmd in ("/start", "/help"):
-            return "Comandos: /status /top /pause /resume"
+            return "Comandos: /status /pos /top /pause /resume"
         return None
 
     # ---------- bucle principal ----------
@@ -217,6 +311,7 @@ class Bot:
                 if bucket != last_bucket and (now % self.tf_sec) >= cfg.scan_delay_sec:
                     last_bucket = bucket
                     self.cycle()
+                self.manage()
                 self.monitor()
             except Exception as e:
                 log.exception("error en bucle")

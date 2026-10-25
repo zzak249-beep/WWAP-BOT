@@ -49,6 +49,7 @@ class Config:
     exclude_bases: tuple = field(
         default_factory=lambda: tuple(x.strip().upper() for x in _s("EXCLUDE_BASES").split(",") if x.strip())
     )
+    include_tradfi: bool = field(default_factory=lambda: _b("INCLUDE_TRADFI", False))
     max_signals_per_scan: int = field(default_factory=lambda: _i("MAX_SIGNALS_PER_SCAN", 3))
     cooldown_candles: int = field(default_factory=lambda: _i("COOLDOWN_CANDLES", 6))
     scan_delay_sec: int = field(default_factory=lambda: _i("SCAN_DELAY_SEC", 5))
@@ -66,6 +67,20 @@ class Config:
     use_session: bool = field(default_factory=lambda: _b("USE_SESSION", True))
     session_start: str = field(default_factory=lambda: _s("SESSION_START", "10:00"))
     session_end: str = field(default_factory=lambda: _s("SESSION_END", "17:00"))
+
+    # tamaño igual por posición
+    equal_size: bool = field(default_factory=lambda: _b("EQUAL_SIZE", True))
+
+    # gestión de ganancias (trailing)
+    trail: bool = field(default_factory=lambda: _b("TRAIL", True))
+    be_r: float = field(default_factory=lambda: _f("BE_R", 1.0))
+    be_buf_pct: float = field(default_factory=lambda: _f("BE_BUF_PCT", 0.12))
+    trail_r: float = field(default_factory=lambda: _f("TRAIL_R", 1.0))
+    trail_step_r: float = field(default_factory=lambda: _f("TRAIL_STEP_R", 0.5))
+    ext_tp: bool = field(default_factory=lambda: _b("EXTEND_TP", True))
+    ext_r: float = field(default_factory=lambda: _f("EXTEND_R", 1.0))
+    max_ext: int = field(default_factory=lambda: _i("MAX_EXTENSIONS", 3))
+    manage_sec: int = field(default_factory=lambda: _i("MANAGE_SEC", 15))
 
     log_level: str = field(default_factory=lambda: _s("LOG_LEVEL", "INFO").upper())
 
